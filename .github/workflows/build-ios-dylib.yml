@@ -1,0 +1,81 @@
+name: Build iOS dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  ios-dylib:
+    name: iOS arm64 dylib
+    runs-on: macos-14
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Report toolchain
+        run: |
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          cmake --version | head -1
+          clang --version | head -1
+
+      - name: Install ninja
+        run: brew install ninja || true
+
+      - name: Build dylib
+        run: |
+          chmod +x build.sh
+
+          if ./build.sh --platform ios --target dylib --build release; then
+            echo "build succeeded on the unmodified sources"
+            exit 0
+          fi
+
+          echo "::warning::stock build failed, retrying with framework link fix"
+
+          # CMakeLists passes four -framework flags as one string; CMake does not
+          # split it, so the linker sees a single unparsable argv. Theos uses
+          # $(TWEAK_NAME)_FRAMEWORKS (correct), so only the CMake iOS path is hit.
+          sed -i '' \
+            's|"-framework Foundation -framework UIKit -framework CoreGraphics -framework QuartzCore"|"-framework" "Foundation" "-framework" "UIKit" "-framework" "CoreGraphics" "-framework" "QuartzCore"|' \
+            CMakeLists.txt
+
+          grep -n "QuartzCore" CMakeLists.txt
+
+          rm -rf builds/ios
+          ./build.sh --platform ios --target dylib --build release
+
+      - name: Verify artifact
+        run: |
+          set -e
+          DYLIB=builds/ios/dylib/release/arm64/libMobileDumper-7.dylib
+          test -f "$DYLIB"
+          lipo -info "$DYLIB"
+          file "$DYLIB"
+          echo "install_name:"
+          otool -D "$DYLIB" || true
+          echo "linked frameworks:"
+          otool -L "$DYLIB" || true
+          echo "size: $(du -h "$DYLIB" | cut -f1)"
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: MobileDumper-7-ios-arm64
+          path: builds/ios/dylib/release/arm64/libMobileDumper-7.dylib
+          if-no-files-found: error
+
+      - name: Upload dSYM
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: MobileDumper-7-ios-arm64-dsym
+          path: builds/ios/dylib/release/arm64/libMobileDumper-7.dylib.dSYM
+          if-no-files-found: warn
