@@ -310,13 +310,16 @@ namespace OffsetFinder
 			PossibleOffsets.push_back(ValueInfo{i});
 		}
 
-		auto GetDataAtOffsetAsInt = [](const void* Ptr, int32_t Offset) -> uint32_t
-		{
-			const uintptr_t Addr = reinterpret_cast<uintptr_t>(Ptr) + Offset;
-			return static_cast<uint32_t>(MD7::Globals::GDecryptCallbacks.FName.CompIdx({.Address = Addr, .RawValue = static_cast<int32>(MD7::Globals::GMemory->Read<uint32_t>(Addr))}));
-		};
-
 		const IteratorType VerifyStartIt = DataSetStartIterator;
+
+		/*
+		 * Every offset probed below lies inside [0, MaxScanOffset + 4), so the whole
+		 * window is read once per object and sliced in place afterwards. On a phone
+		 * every GMemory read is a syscall, and the previous shape paid one per
+		 * candidate offset - around a hundred per object.
+		 */
+		const int32_t WindowSize = MaxScanOffset + static_cast<int32_t>(sizeof(uint32_t));
+		std::vector<uint8_t> Window(WindowSize > 0 ? static_cast<size_t>(WindowSize) : 0u);
 
 		int NumObjectsConsidered = 0;
 
@@ -326,22 +329,29 @@ namespace OffsetFinder
 				break;
 
 			constexpr auto SmallPageSize = 0x1000;
-			const auto MaxAccessedSizeInUObject = MaxScanOffset + static_cast<int32_t>(sizeof(uint32_t));
+			const auto MaxAccessedSizeInUObject = WindowSize;
 
 			// Object allocations are page-aligned in both size and base, and UObject's real size
 			// isn't known yet (that's what this offset search is for) - so an object within
 			// MaxAccessedSizeInUObject of a page boundary might read past its actual allocation.
 			const void* CurrentObjectOrField = (*DataSetStartIterator).GetAddress();
-			if (!CurrentObjectOrField)
+			if (!CurrentObjectOrField || Window.empty())
 				continue;
 
 			const bool bIsGoingPastPageBounds = (reinterpret_cast<const uintptr_t>(CurrentObjectOrField) & (SmallPageSize - 1)) > (SmallPageSize - MaxAccessedSizeInUObject);
 			if (bIsGoingPastPageBounds)
 				continue;
 
+			const uintptr_t ObjectAddr = reinterpret_cast<uintptr_t>(CurrentObjectOrField);
+			if (MD7::Globals::GMemory->ReadBytes(ObjectAddr, Window.data(), Window.size()) != Window.size())
+				continue;
+
 			for (ValueInfo& Info : PossibleOffsets)
 			{
-				const uint32_t ValueAtOffset = GetDataAtOffsetAsInt(CurrentObjectOrField, Info.Offset);
+				uint32_t RawValue = 0;
+				std::memcpy(&RawValue, Window.data() + Info.Offset, sizeof(RawValue));
+
+				const uint32_t ValueAtOffset = static_cast<uint32_t>(MD7::Globals::GDecryptCallbacks.FName.CompIdx({.Address = ObjectAddr + Info.Offset, .RawValue = static_cast<int32>(RawValue)}));
 
 				Info.TotalValue            += ValueAtOffset;
 				Info.bIsValidCmpIdxRange    = Info.bIsValidCmpIdxRange && ValueAtOffset < MaxAllowedComparisonIndexValue;
