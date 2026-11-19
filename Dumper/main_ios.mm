@@ -1,14 +1,18 @@
 #ifdef __APPLE__
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <mach/mach.h>
+#include <mach/thread_info.h>
 #include <mach-o/dyld.h>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <pthread.h>
+#include <sched.h>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -344,11 +348,48 @@ void ShowDumpAlert()
 	});
 }
 
-/// Suspends all game threads for the lifetime of this object.
-/// Skips the calling thread and the main (UI) thread — suspending either
+/// Freezes the game's threads for the lifetime of this object.
+///
+/// A blanket suspension of every thread is not safe on iOS, for two reasons:
+///
+///   * CoreAudio's IO thread runs under a realtime policy. Freezing it for more
+///     than a fraction of a second makes the system kill the whole process with
+///     SIGKILL - no exception handler can catch that. Realtime threads are
+///     therefore left running.
+///   * A dump can stall against a game that keeps mutating what it reads. Holding
+///     every thread suspended while that resolves is a second way to get killed,
+///     so a watchdog resumes them after a bounded time and lets the dump finish
+///     against a slightly less consistent snapshot: worse output, but alive.
 class FThreadSuspension
 {
+	/// How long the game may stay frozen before the watchdog releases it.
+	static constexpr std::chrono::seconds kMaxFrozenDuration{180};
+
 	std::vector<thread_t> SuspendedThreads;
+	std::mutex Mtx;
+	std::condition_variable Cv;
+	std::thread Watchdog;
+	bool bFinished = false;
+	bool bResumed  = false;
+
+	void ResumeAll()
+	{
+		std::lock_guard<std::mutex> Lock(Mtx);
+		if (bResumed)
+			return;
+		bResumed = true;
+
+		const size_t Count = SuspendedThreads.size();
+		for (thread_t T : SuspendedThreads)
+		{
+			thread_resume(T);
+			mach_port_deallocate(mach_task_self(), T);
+		}
+		SuspendedThreads.clear();
+
+		if (Count)
+			MD7::Globals::GLogger.FmtWrite(ELogLevel::Info, "Resumed {} game thread(s).\n", Count);
+	}
 
 public:
 	FThreadSuspension(const FThreadSuspension&)            = delete;
@@ -377,6 +418,18 @@ public:
 				mach_port_deallocate(mach_task_self(), T);
 				continue;
 			}
+
+			/* Realtime threads drive audio and I/O; freezing one is what gets the
+			 * process killed, so they are deliberately left running. */
+			thread_sched_info_data_t SchedInfo{};
+			mach_msg_type_number_t SchedCount = THREAD_SCHED_INFO_COUNT;
+			if (thread_info(T, THREAD_SCHED_INFO, reinterpret_cast<thread_info_t>(&SchedInfo), &SchedCount) == KERN_SUCCESS &&
+			    (SchedInfo.policy == SCHED_RR || SchedInfo.policy == SCHED_FIFO))
+			{
+				mach_port_deallocate(mach_task_self(), T);
+				continue;
+			}
+
 			if (thread_suspend(T) == KERN_SUCCESS)
 				SuspendedThreads.push_back(T);
 			else
@@ -387,17 +440,34 @@ public:
 		mach_port_deallocate(mach_task_self(), SelfThread);
 
 		MD7::Globals::GLogger.FmtWrite(ELogLevel::Info, "Suspended {} game thread(s).\n", SuspendedThreads.size());
+
+		Watchdog = std::thread([this]
+		{
+			std::unique_lock<std::mutex> Lock(Mtx);
+			if (Cv.wait_for(Lock, kMaxFrozenDuration, [this] { return bFinished; }))
+				return;
+
+			Lock.unlock();
+			MD7::Globals::GLogger.FmtWrite(ELogLevel::Warning,
+			                               "FThreadSuspension: dump exceeded {}s, resuming threads early.\n",
+			                               static_cast<int>(kMaxFrozenDuration.count()));
+			ResumeAll();
+		});
 	}
 
 	~FThreadSuspension()
 	{
-		for (thread_t T : SuspendedThreads)
+		if (Watchdog.joinable())
 		{
-			thread_resume(T);
-			mach_port_deallocate(mach_task_self(), T);
+			{
+				std::lock_guard<std::mutex> Lock(Mtx);
+				bFinished = true;
+			}
+			Cv.notify_all();
+			Watchdog.join();
 		}
-		if (!SuspendedThreads.empty())
-			MD7::Globals::GLogger.FmtWrite(ELogLevel::Info, "Resumed {} game thread(s).\n", SuspendedThreads.size());
+
+		ResumeAll();
 	}
 };
 
