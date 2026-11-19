@@ -420,11 +420,14 @@ public:
 			}
 
 			/* Realtime threads drive audio and I/O; freezing one is what gets the
-			 * process killed, so they are deliberately left running. */
-			thread_sched_info_data_t SchedInfo{};
-			mach_msg_type_number_t SchedCount = THREAD_SCHED_INFO_COUNT;
-			if (thread_info(T, THREAD_SCHED_INFO, reinterpret_cast<thread_info_t>(&SchedInfo), &SchedCount) == KERN_SUCCESS &&
-			    (SchedInfo.policy == SCHED_RR || SchedInfo.policy == SCHED_FIFO))
+			 * process killed, so they are deliberately left running.
+			 *
+			 * THREAD_BASIC_INFO rather than THREAD_SCHED_INFO: the latter is not
+			 * exposed in the iOS SDK, but basic info carries the same policy field. */
+			thread_basic_info_data_t BasicInfo{};
+			mach_msg_type_number_t BasicCount = THREAD_BASIC_INFO_COUNT;
+			if (thread_info(T, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&BasicInfo), &BasicCount) == KERN_SUCCESS &&
+			    (BasicInfo.policy == SCHED_RR || BasicInfo.policy == SCHED_FIFO))
 			{
 				mach_port_deallocate(mach_task_self(), T);
 				continue;
